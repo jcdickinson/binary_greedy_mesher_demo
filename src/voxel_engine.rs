@@ -333,7 +333,7 @@ pub fn start_mesh_tasks(
     let tasks_left = (MAX_MESH_TASKS as i32 - mesh_tasks.len() as i32)
         .min(load_mesh_queue.len() as i32)
         .max(0) as usize;
-    for world_pos in load_mesh_queue.drain(0..tasks_left) {
+    for world_pos in load_mesh_queue.drain(..) {
         // for world_pos in load_mesh_queue.drain(..) {
         let Some(chunks_refs) = ChunksRefs::try_new(world_data, world_pos) else {
             continue;
