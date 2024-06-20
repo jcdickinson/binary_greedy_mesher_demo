@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use bevy::{
     asset::LoadState,
@@ -53,6 +53,7 @@ impl Plugin for VoxelEnginePlugin {
         app.register_diagnostic(Diagnostic::new(DIAG_VERTEX_COUNT));
         app.register_diagnostic(Diagnostic::new(DIAG_MESH_TASKS));
         app.register_diagnostic(Diagnostic::new(DIAG_DATA_TASKS));
+        app.register_diagnostic(Diagnostic::new(DIAG_CREATION_TIME));
         app.add_systems(Update, diagnostics_count);
     }
 }
@@ -62,6 +63,10 @@ pub fn debug_inputs(
     mut voxel_engine: ResMut<VoxelEngine>,
     scanners: Query<(&GlobalTransform, &Scanner)>,
 ) {
+    if keyboard_input.just_pressed(KeyCode::KeyC) {
+        let (scanner_transform, scanner) = scanners.single();
+        voxel_engine.unload_all_meshes(scanner, scanner_transform);
+    }
     if keyboard_input.just_pressed(KeyCode::KeyR) {
         // swap meshing algorithm
         use MeshingMethod as MM;
@@ -69,6 +74,7 @@ pub fn debug_inputs(
             MM::VertexCulled => MM::BinaryGreedyMeshing,
             MM::BinaryGreedyMeshing => MM::VertexCulled,
         };
+        println!("now using {:?}", voxel_engine.meshing_method);
         let (scanner_transform, scanner) = scanners.single();
         // unload all meshes
         voxel_engine.unload_all_meshes(scanner, scanner_transform);
@@ -111,6 +117,7 @@ const DIAG_UNLOAD_MESH_QUEUE: DiagnosticPath = DiagnosticPath::const_new("unload
 const DIAG_VERTEX_COUNT: DiagnosticPath = DiagnosticPath::const_new("vertex_count");
 const DIAG_MESH_TASKS: DiagnosticPath = DiagnosticPath::const_new("mesh_tasks");
 const DIAG_DATA_TASKS: DiagnosticPath = DiagnosticPath::const_new("data_tasks");
+const DIAG_CREATION_TIME: DiagnosticPath = DiagnosticPath::const_new("creation_time");
 
 fn setup_diagnostics(mut onscreen: ResMut<ScreenDiagnostics>) {
     onscreen
@@ -141,6 +148,10 @@ fn setup_diagnostics(mut onscreen: ResMut<ScreenDiagnostics>) {
         .add("data_tasks".to_string(), DIAG_DATA_TASKS)
         .aggregate(Aggregate::Value)
         .format(|v| format!("{v:0>2.0}"));
+    onscreen
+        .add("last_creation_time".to_string(), DIAG_CREATION_TIME)
+        .aggregate(Aggregate::Value)
+        .format(|v| format!("{v:0>4.0}"));
 }
 
 fn diagnostics_count(mut diagnostics: Diagnostics, voxel_engine: Res<VoxelEngine>) {
@@ -156,7 +167,16 @@ fn diagnostics_count(mut diagnostics: Diagnostics, voxel_engine: Res<VoxelEngine
     diagnostics.add_measurement(&DIAG_UNLOAD_MESH_QUEUE, || {
         voxel_engine.unload_mesh_queue.len() as f64
     });
-    diagnostics.add_measurement(&DIAG_MESH_TASKS, || voxel_engine.mesh_tasks.len() as f64);
+    diagnostics.add_measurement(&DIAG_MESH_TASKS, || {
+        let result = voxel_engine.mesh_tasks.len();
+        if result == 0 {
+            let unload = LAST_UNLOAD.swap(0, std::sync::atomic::Ordering::Acquire);
+            if unload != 0 {
+                LAST_TIME.store(get_elapsed() - unload, std::sync::atomic::Ordering::Release);
+            }
+        }
+        result as f64
+    });
     diagnostics.add_measurement(&DIAG_DATA_TASKS, || voxel_engine.data_tasks.len() as f64);
     diagnostics.add_measurement(&DIAG_VERTEX_COUNT, || {
         voxel_engine
@@ -165,10 +185,25 @@ fn diagnostics_count(mut diagnostics: Diagnostics, voxel_engine: Res<VoxelEngine
             .map(|(_, v)| v)
             .sum::<i32>() as f64
     });
+    diagnostics.add_measurement(&DIAG_CREATION_TIME, || {
+        LAST_TIME.load(std::sync::atomic::Ordering::Acquire) as f64
+    });
+}
+
+static LAST_UNLOAD: AtomicU64 = AtomicU64::new(0);
+static LAST_TIME: AtomicU64 = AtomicU64::new(0);
+
+fn get_elapsed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 impl VoxelEngine {
     pub fn unload_all_meshes(&mut self, scanner: &Scanner, scanner_transform: &GlobalTransform) {
+        LAST_UNLOAD.store(get_elapsed(), std::sync::atomic::Ordering::Release);
+
         // stop all any current proccessing
         self.load_mesh_queue.clear();
         // self.unload_mesh_queue.clear();
