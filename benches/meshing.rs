@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use bevy::{math::IVec3, utils::HashMap};
+use bumpalo::Bump;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use new_voxel_testing::{
     chunk::ChunkData,
@@ -21,8 +22,8 @@ fn bench_mesh_no_ao(chunks_refs: ChunksRefs) {
     greedy_mesher::build_chunk_mesh_no_ao(chunks_refs, Lod::L32);
 }
 
-fn binary_mesh_optimized(chunks_refs: ChunksRefs) {
-    let m = greedy_mesher_optimized::build_chunk_mesh(&chunks_refs, Lod::L32);
+fn binary_mesh_optimized(arena: &Bump, chunks_refs: ChunksRefs) {
+    let m = greedy_mesher_optimized::build_chunk_mesh(arena, &chunks_refs, Lod::L32);
 }
 
 fn culled_mesh_ao(chunks_refs: ChunksRefs) {
@@ -59,8 +60,8 @@ fn make_filled() -> ChunksRefs {
     ChunksRefs { chunks }
 }
 
-fn slicer(data: [u32; 32]) {
-    greedy_mesher_optimized::greedy_mesh_binary_plane(data, 32);
+fn slicer(arena: &Bump, data: [u32; 32]) {
+    greedy_mesher_optimized::greedy_mesh_binary_plane(arena, data, 32);
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -94,7 +95,26 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     c.bench_function("GREEDY meshing OPTIMIZED: 1 chunk [ao]", |b| {
         let mut s = 0;
-        b.iter_with_setup(|| make_chunks_refs(&mut s), |i| binary_mesh_optimized(i))
+        b.iter_with_setup(
+            || make_chunks_refs(&mut s),
+            |i| binary_mesh_optimized(&Bump::new(), i),
+        )
+    });
+
+    c.bench_function("GREEDY meshing OPTIMIZED with ARENA: 1 chunk [ao]", |b| {
+        let mut s = 0;
+        b.iter_with_setup(
+            || {
+                (
+                    make_chunks_refs(&mut s),
+                    Bump::with_capacity(1024 * 1024 * 20),
+                )
+            },
+            |(i, mut arena)| {
+                binary_mesh_optimized(&arena, i);
+                arena.reset();
+            },
+        )
     });
     // c.bench_function("GREEDY meshing OPTIMIZED: 1 chunk [ao] FILLED", |b| {
     //     b.iter_with_setup(|| make_filled(), |i| binary_mesh_optimized(i))

@@ -8,6 +8,7 @@ pub mod face_direction;
 pub mod greedy_mesher;
 pub mod greedy_mesher_optimized;
 pub mod lod;
+pub mod pool;
 pub mod quad;
 pub mod rendering;
 pub mod scanner;

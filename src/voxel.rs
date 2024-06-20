@@ -1,5 +1,5 @@
 #[repr(u32)]
-#[derive(Eq, PartialEq, Default, Copy, Clone, Debug)]
+#[derive(Debug, Eq, PartialEq, Default, Copy, Clone, PartialOrd, Ord)]
 pub enum BlockType {
     #[default]
     Air,

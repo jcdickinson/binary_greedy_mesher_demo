@@ -92,9 +92,8 @@ pub fn world_to_chunk(pos: Vec3) -> IVec3 {
 ///! generate a vec of indices
 ///! assumes vertices are made of quads, and counter clockwise ordered
 #[inline]
-pub fn generate_indices(vertex_count: usize) -> Vec<u32> {
+pub fn generate_indices(indices: &mut Vec<u32>, vertex_count: usize) {
     let indices_count = vertex_count / 4;
-    let mut indices = Vec::<u32>::with_capacity(indices_count);
     (0..indices_count).into_iter().for_each(|vert_index| {
         let vert_index = vert_index as u32 * 4u32;
         indices.push(vert_index);
@@ -104,7 +103,6 @@ pub fn generate_indices(vertex_count: usize) -> Vec<u32> {
         indices.push(vert_index + 2);
         indices.push(vert_index + 3);
     });
-    indices
 }
 
 #[test]

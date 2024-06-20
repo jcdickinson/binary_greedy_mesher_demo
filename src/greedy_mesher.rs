@@ -26,7 +26,7 @@ pub fn build_chunk_mesh(chunks_refs: ChunksRefs, lod: Lod) -> Option<ChunkMesh> 
     if mesh.vertices.is_empty() {
         None
     } else {
-        mesh.indices = generate_indices(mesh.vertices.len());
+        generate_indices(&mut mesh.indices, mesh.vertices.len());
         Some(mesh)
     }
 }
@@ -48,7 +48,7 @@ pub fn build_chunk_mesh_no_ao(chunks_refs: ChunksRefs, lod: Lod) -> Option<Chunk
     if mesh.vertices.is_empty() {
         None
     } else {
-        mesh.indices = generate_indices(mesh.vertices.len());
+        generate_indices(&mut mesh.indices, mesh.vertices.len());
         Some(mesh)
     }
 }

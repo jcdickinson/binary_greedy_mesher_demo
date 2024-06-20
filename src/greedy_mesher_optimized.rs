@@ -1,31 +1,69 @@
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, ops::DerefMut as _};
 
 use bevy::{math::ivec3, prelude::*, utils::HashMap};
+use bumpalo::{collections::Vec, Bump};
+use once_cell::sync::Lazy;
 
 use crate::{
     chunk_mesh::ChunkMesh,
     chunks_refs::ChunksRefs,
-    constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE_P, CHUNK_SIZE_P2, CHUNK_SIZE_P3},
+    constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE_P},
     face_direction::FaceDir,
     lod::Lod,
+    pool::{Reset, SimplePool},
     utils::{generate_indices, make_vertex_u32, vec3_to_index},
 };
 
-pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh> {
+struct PooledMemory {
+    axis_cols: Box<[[[u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3]>,
+    col_face_masks: Box<[[[u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 6]>,
+}
+
+impl Default for PooledMemory {
+    fn default() -> Self {
+        // This is much slower than allocating on the stack because the allocation first happens on the stack, then
+        // it is copied to the heap.
+        Self {
+            axis_cols: Box::new([[[0u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3]),
+            col_face_masks: Box::new([[[0u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 6]),
+        }
+    }
+}
+
+impl Reset for PooledMemory {
+    fn reset(mut self) -> Option<Self> {
+        for v in self.axis_cols.iter_mut() {
+            for v in v.iter_mut() {
+                v.fill(0)
+            }
+        }
+        for v in self.col_face_masks.iter_mut() {
+            for v in v.iter_mut() {
+                v.fill(0)
+            }
+        }
+        Some(self)
+    }
+}
+
+static MEM_POOL: Lazy<SimplePool<PooledMemory>> = Lazy::new(SimplePool::default);
+static HASH_POOL: Lazy<SimplePool<HashMap<u32, [[u32; 32]; CHUNK_SIZE]>>> =
+    Lazy::new(SimplePool::default);
+
+pub fn build_chunk_mesh(arena: &Bump, chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh> {
     // early exit, if all faces are culled
     if chunks_refs.is_all_voxels_same() {
         return None;
     }
     let mut mesh = ChunkMesh::default();
 
-    // solid binary for each x,y,z axis (3)
-    let mut axis_cols = [[[0u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3];
+    let mut mem = MEM_POOL.take();
 
-    // the cull mask to perform greedy slicing, based on solids on previous axis_cols
-    let mut col_face_masks = [[[0u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 6];
+    // solid binary for each x,y,z axis (3)
+    let PooledMemory {
+        ref mut axis_cols,
+        ref mut col_face_masks,
+    } = mem.deref_mut();
 
     #[inline]
     fn add_voxel_to_axis_cols(
@@ -55,7 +93,7 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
                     1 => 0,
                     _ => (z * CHUNK_SIZE + y) * CHUNK_SIZE + x,
                 };
-                add_voxel_to_axis_cols(&chunk.voxels[i], x + 1, y + 1, z + 1, &mut axis_cols)
+                add_voxel_to_axis_cols(&chunk.voxels[i], x + 1, y + 1, z + 1, axis_cols)
             }
         }
     }
@@ -68,7 +106,7 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
         for y in 0..CHUNK_SIZE_P {
             for x in 0..CHUNK_SIZE_P {
                 let pos = ivec3(x as i32, y as i32, z as i32) - IVec3::ONE;
-                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, &mut axis_cols);
+                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, axis_cols);
             }
         }
     }
@@ -76,7 +114,7 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
         for y in [0, CHUNK_SIZE_P - 1] {
             for x in 0..CHUNK_SIZE_P {
                 let pos = ivec3(x as i32, y as i32, z as i32) - IVec3::ONE;
-                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, &mut axis_cols);
+                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, axis_cols);
             }
         }
     }
@@ -84,7 +122,7 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
         for x in [0, CHUNK_SIZE_P - 1] {
             for y in 0..CHUNK_SIZE_P {
                 let pos = ivec3(x as i32, y as i32, z as i32) - IVec3::ONE;
-                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, &mut axis_cols);
+                add_voxel_to_axis_cols(chunks_refs.get_block(pos), x, y, z, axis_cols);
             }
         }
     }
@@ -109,22 +147,17 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
     // note(leddoo): don't ask me how this isn't a massive blottleneck.
     //  might become an issue in the future, when there are more block types.
     //  consider using a single hashmap with key (axis, block_hash, y).
-    let mut data: [HashMap<u32, HashMap<u32, [u32; 32]>>; 6];
-    data = [
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-    ];
+    let mut data: [_; 6] = std::array::from_fn(|_| HASH_POOL.take());
 
     // find faces and build binary planes based on the voxel block+ao etc...
     for axis in 0..6 {
+        let axis_data = &mut data[axis];
+        let col_face_mask = &mut col_face_masks[axis];
         for z in 0..CHUNK_SIZE {
+            let col_face_mask_z = &mut col_face_mask[z + 1];
             for x in 0..CHUNK_SIZE {
                 // skip padded by adding 1(for x padding) and (z+1) for (z padding)
-                let mut col = col_face_masks[axis][z + 1][x + 1];
+                let mut col = col_face_mask_z[x + 1];
 
                 // removes the right most padding value, because it's invalid
                 col >>= 1;
@@ -166,19 +199,15 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
                     // let current_voxel = chunks_refs.get_block(voxel_pos);
                     // we can only greedy mesh same block types + same ambient occlusion
                     let block_hash = ao_index | ((current_voxel.block_type as u32) << 9);
-                    let data = data[axis]
-                        .entry(block_hash)
-                        .or_default()
-                        .entry(y)
-                        .or_default();
-                    data[x as usize] |= 1u32 << z as u32;
+                    let data = &mut axis_data.entry(block_hash).or_default()[y as usize];
+                    data[x] |= 1u32 << z as u32;
                 }
             }
         }
     }
 
     let mut vertices = vec![];
-    for (axis, block_ao_data) in data.into_iter().enumerate() {
+    for (axis, mut block_ao_data) in data.into_iter().enumerate() {
         let facedir = match axis {
             0 => FaceDir::Down,
             1 => FaceDir::Up,
@@ -187,14 +216,21 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
             4 => FaceDir::Forward,
             _ => FaceDir::Back,
         };
-        for (block_ao, axis_plane) in block_ao_data.into_iter() {
+        for (block_ao, axis_plane) in block_ao_data.iter_mut() {
             let ao = block_ao & 0b111111111;
             let block_type = block_ao >> 9;
-            for (axis_pos, plane) in axis_plane.into_iter() {
-                let quads_from_axis = greedy_mesh_binary_plane(plane, lod.size() as u32);
+            for (axis_pos, plane) in axis_plane.iter_mut().enumerate() {
+                let quads_from_axis = greedy_mesh_binary_plane(arena, plane, lod.size() as u32);
 
                 quads_from_axis.into_iter().for_each(|q| {
-                    q.append_vertices(&mut vertices, facedir, axis_pos, &Lod::L32, ao, block_type)
+                    q.append_vertices(
+                        &mut vertices,
+                        facedir,
+                        axis_pos as u32,
+                        &Lod::L32,
+                        ao,
+                        block_type,
+                    )
                 });
             }
         }
@@ -204,7 +240,7 @@ pub fn build_chunk_mesh(chunks_refs: &ChunksRefs, lod: Lod) -> Option<ChunkMesh>
     if mesh.vertices.is_empty() {
         None
     } else {
-        mesh.indices = generate_indices(mesh.vertices.len());
+        generate_indices(&mut mesh.indices, mesh.vertices.len());
         Some(mesh)
     }
 }
@@ -222,7 +258,7 @@ impl GreedyQuad {
     ///! compress this quad data into the input vertices vec
     pub fn append_vertices(
         &self,
-        vertices: &mut Vec<u32>,
+        vertices: &mut impl Extend<u32>,
         face_dir: FaceDir,
         axis: u32,
         lod: &Lod,
@@ -304,8 +340,12 @@ impl GreedyQuad {
 
 ///! generate quads of a binary slice
 ///! lod not implemented atm
-pub fn greedy_mesh_binary_plane(mut data: [u32; 32], lod_size: u32) -> Vec<GreedyQuad> {
-    let mut greedy_quads = vec![];
+pub fn greedy_mesh_binary_plane<'a, 'b>(
+    arena: &'a Bump,
+    data: &'b mut [u32; 32],
+    lod_size: u32,
+) -> Vec<'a, GreedyQuad> {
+    let mut greedy_quads = Vec::new_in(arena);
     for row in 0..data.len() {
         let mut y = 0;
         while y < lod_size {
